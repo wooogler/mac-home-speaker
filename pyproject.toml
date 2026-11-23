@@ -1,0 +1,23 @@
+[project]
+name = "mac-home-speaker"
+version = "0.1.0"
+description = "낡은 맥북을 홈 스피커로 쓰는 음성 어시스턴트"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "anthropic>=1.1.0",
+    "openai>=1.50.0",
+    "numpy",
+    "sounddevice",
+    "openwakeword",
+    "onnxruntime",
+    "mlx-whisper",
+    "ytmusicapi",
+    "yt-dlp[default]",
+    "python-dotenv",
+    "mlx-audio>=0.6.5",
+    "pyobjc-framework-eventkit>=13.0",
+    "audiotsm>=0.1.2",
+]
+
+[tool.uv]
+package = false
