@@ -13,7 +13,7 @@ import threading
 import time
 import warnings
 
-from .config import Config, load_config
+from .config import PROVIDER_KEYS, Config, load_config
 from .schedule import Event, Scheduler, spoken_clock
 from .tools import ToolBox, load_state, save_state
 
@@ -86,14 +86,45 @@ def _running_speaker(pid_file) -> int | None:
     return pid if "-m speaker" in cmd else None
 
 
-def _git(cfg: Config, *args: str) -> str | None:
+def _git(cfg: Config, *args: str, timeout: float = 10) -> str | None:
     import subprocess
 
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")  # 로그인 창을 띄우며 멈추지 않게
     try:
-        r = subprocess.run(["git", "-C", str(cfg.project_dir), *args], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["git", "-C", str(cfg.project_dir), *args], capture_output=True, text=True,
+                           timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _pull_update(cfg: Config) -> bool:
+    """GitHub(원격 저장소)에 새 버전이 있으면 받아 온다. 받았으면 True.
+
+    받아 온 뒤 다시 켜는 건 _check_code_change 가 한가할 때 한다. 패키지가 바뀌었으면 다시 켤 때
+    start.command 의 `uv run` 이 알아서 맞춘다. 사용자가 코드를 고쳐 뒀거나 따로 커밋해 둔 경우에는
+    덮어쓰지 않고 건너뛴다.
+    """
+    upstream = _git(cfg, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if not upstream:
+        return False
+    if _git(cfg, "fetch", "--quiet", timeout=90) is None:
+        log.info("새 버전을 확인하지 못했습니다 (인터넷 연결 확인).")
+        return False
+    head, remote = _git(cfg, "rev-parse", "HEAD"), _git(cfg, "rev-parse", "@{u}")
+    if not head or not remote or head == remote:
+        return False
+    if _git(cfg, "merge-base", "--is-ancestor", "HEAD", "@{u}") is None:
+        log.info("이 맥에만 있는 커밋이 있어 새 버전을 자동으로 받지 않습니다 (%s).", upstream)
+        return False
+    if _git(cfg, "status", "--porcelain", "--untracked-files=no"):
+        log.info("고친 코드가 있어 새 버전을 자동으로 받지 않습니다. git status 로 확인해 주세요.")
+        return False
+    if _git(cfg, "merge", "--ff-only", "--quiet", "@{u}", timeout=60) is None:
+        log.warning("새 버전을 받다가 실패했습니다.")
+        return False
+    log.info("새 버전을 받았습니다: %s → %s", head[:7], remote[:7])
+    return True
 
 
 def _code_stamp(cfg: Config) -> tuple:
@@ -163,6 +194,8 @@ class Assistant:
         # 코드가 바뀌면 (원격 개발 중) 한가할 때 스스로 다시 켠다
         self._code_stamp = _code_stamp(cfg)
         self._next_code_check = 0.0
+        self._next_update_check = time.monotonic() + 120  # 켜고 2분 뒤 처음 확인
+        self._update_thread: threading.Thread | None = None
         self._brain_thread: threading.Thread | None = None
         # 호출어 때문에 잠시 멈춘 음악을 대화가 끝난 뒤 다시 틀어야 하는지
         self._resume_music = False
@@ -215,6 +248,7 @@ class Assistant:
                 self._handle_remote()
                 self._watch_track()
                 self._watch_near_wake()
+                self._check_remote_update()
                 self._check_code_change()
                 continue
             try:
@@ -610,6 +644,17 @@ class Assistant:
                 self.speaker.say("업데이트가 있었어요. " + " ".join(_as_sentence(c) for c in spoken) + more)
         save_state(self.cfg, announced_commit=head)
 
+    def _check_remote_update(self) -> None:
+        """AUTO_UPDATE=on 이면 가끔 GitHub 에 새 버전이 있는지 보고 받아 온다 (따로 도는 스레드에서)."""
+        if not (self.cfg.auto_update and self.cfg.auto_reload):
+            return
+        now = time.monotonic()
+        if now < self._next_update_check or (self._update_thread and self._update_thread.is_alive()):
+            return
+        self._next_update_check = now + self.cfg.auto_update_hours * 3600
+        self._update_thread = threading.Thread(target=_pull_update, args=(self.cfg,), name="auto-update", daemon=True)
+        self._update_thread.start()
+
     def _check_code_change(self) -> None:
         """대기 중에 새 커밋(또는 .env 변경)을 알아채면, 음악·말이 없을 때 다시 시작한다 (AUTO_RELOAD=off 로 끔)."""
         if not self.cfg.auto_reload:
@@ -815,6 +860,10 @@ def run_text(cfg: Config, speak: bool) -> None:
 # ---------------------------------------------------------------------- 점검
 
 
+def _brain_key(cfg: Config) -> str | None:
+    return {"anthropic": cfg.anthropic_api_key, "openai": cfg.openai_api_key, "google": cfg.gemini_api_key}[cfg.provider]
+
+
 def run_check(cfg: Config) -> int:
     """설정과 장치를 점검해 무엇이 빠졌는지 알려 준다."""
     import shutil
@@ -830,7 +879,8 @@ def run_check(cfg: Config) -> int:
         if not good and required:
             ok = False
 
-    line(bool(cfg.anthropic_api_key), "ANTHROPIC_API_KEY", "" if cfg.anthropic_api_key else ".env 에 넣어 주세요")
+    key_name = PROVIDER_KEYS[cfg.provider]
+    line(bool(_brain_key(cfg)), key_name, f"두뇌 {cfg.provider}" if _brain_key(cfg) else ".env 에 넣어 주세요")
     if cfg.tts_backend == "openai":
         line(bool(cfg.openai_api_key), "OPENAI_API_KEY", "" if cfg.openai_api_key else "없음 → macOS 내장 음성 사용", required=False)
     line(bool(cfg.mpv_path and os.path.exists(cfg.mpv_path)), "mpv", cfg.mpv_path or "brew install mpv")
@@ -849,7 +899,7 @@ def run_check(cfg: Config) -> int:
     except Exception as exc:
         line(False, "스피커", str(exc))
     voice = {"auto": cfg.qwen_tts_model, "qwen": cfg.qwen_tts_model, "openai": cfg.openai_tts_model}.get(cfg.tts_backend, cfg.say_voice)
-    print(f"\n모델: {cfg.claude_model} (effort {cfg.claude_effort}) / 호출어: {cfg.wake_word}")
+    print(f"\n두뇌: {cfg.provider} {cfg.model} (effort {cfg.effort}) / 호출어: {cfg.wake_word}")
     print(f"음성 인식: {cfg.whisper_model} / 음성 합성: {voice}")
     return 0 if ok else 1
 
@@ -866,8 +916,8 @@ def main() -> int:
     if args.check:
         return run_check(cfg)
     setup_logging(cfg, args.verbose)
-    if not cfg.anthropic_api_key:
-        print("ANTHROPIC_API_KEY 가 없습니다. .env.example 을 .env 로 복사해 키를 넣어 주세요.", file=sys.stderr)
+    if not _brain_key(cfg):
+        print(f"{PROVIDER_KEYS[cfg.provider]} 가 없습니다. ./setup.sh 를 실행하거나 .env 에 키를 넣어 주세요.", file=sys.stderr)
         return 1
     if args.text:
         run_text(cfg, args.speak)

@@ -60,15 +60,36 @@ PY
 }
 get_env() { grep -E "^$1=" .env | head -1 | cut -d= -f2-; }
 
-if [[ -z "$(get_env ANTHROPIC_API_KEY)" ]]; then
-  print "Claude API 키가 필요합니다. https://console.anthropic.com 에서 로그인 → API Keys → Create Key 로 만들고,"
-  print "결제 수단을 등록해 두세요. 키는 이 맥의 .env 파일에만 저장됩니다."
-  print -n "API 키를 붙여 넣고 Enter (화면에 보이지 않아요): "
+if [[ -z "$(get_env ANTHROPIC_API_KEY)$(get_env OPENAI_API_KEY)$(get_env GEMINI_API_KEY)" ]]; then
+  print "스피커의 두뇌로 쓸 AI 를 고르세요. 쓴 만큼 요금이 나오는 API 키가 필요합니다."
+  print "  1) Claude  (Anthropic, 권장)  https://console.anthropic.com → API Keys"
+  print "  2) ChatGPT (OpenAI)           https://platform.openai.com/api-keys"
+  print "  3) Gemini  (Google)           https://aistudio.google.com/apikey"
+  print -n "번호 [1]: "; read -r choice
+  case "$choice" in
+    2) provider=openai; key_name=OPENAI_API_KEY ;;
+    3) provider=google; key_name=GEMINI_API_KEY ;;
+    *) provider=anthropic; key_name=ANTHROPIC_API_KEY ;;
+  esac
+  set_env SPEAKER_PROVIDER "$provider"
+  print "키는 이 맥의 .env 파일에만 저장됩니다."
+  print -n "$key_name 를 붙여 넣고 Enter (화면에 보이지 않아요): "
   read -rs api_key; print
-  [[ -n "$api_key" ]] && set_env ANTHROPIC_API_KEY "$api_key" && ok "API 키 저장"
+  [[ -n "$api_key" ]] && set_env "$key_name" "$api_key" && ok "API 키 저장 ($provider)"
   unset api_key
 else
   ok "API 키가 이미 있습니다."
+fi
+
+if ! grep -qE "^AUTO_UPDATE=" .env; then
+  print "GitHub 에 새 버전이 올라오면 한가할 때 자동으로 받아 다시 켤까요?"
+  print "(이 맥에서 코드를 직접 고쳐 둔 경우에는 덮어쓰지 않고 건너뜁니다.)"
+  print -n "자동 업데이트 [Y/n]: "; read -r yn
+  if [[ "${yn:l}" == n* ]]; then
+    set_env AUTO_UPDATE off; ok "자동 업데이트 끔 (git pull 로 직접 업데이트)"
+  else
+    set_env AUTO_UPDATE on; ok "자동 업데이트 켬"
+  fi
 fi
 
 if [[ -z "$(get_env LOCATION_CITY)" ]]; then

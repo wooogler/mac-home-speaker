@@ -110,21 +110,45 @@ class SentenceSplitter:
             self._emit(rest)
 
 
-class Brain:
+class BaseBrain:
+    """제공자(Claude·OpenAI·Gemini)와 상관없는 대화 관리: 새 대화 판단, 끼어들기, 주변 소리 무시, 대화 줄이기, 요약.
+
+    대화 기록 self.messages 의 형식은 제공자마다 다르지만, 사용자 말 한 턴은 언제나
+    {"role": "user", "content": "<상황 줄>\n<말>"} 사전으로 넣는다 (줄이기·요약이 이것을 기준으로 삼는다).
+    제공자 구현은 _run_turn, _complete, _describe, _error_kind 를 채운다.
+    """
+
+    provider = ""
+
     def __init__(self, cfg: Config, toolbox: ToolBox):
-        if not cfg.anthropic_api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY 가 없습니다. .env 파일에 넣어 주세요.")
         self.cfg = cfg
         self.toolbox = toolbox
-        self.client = anthropic.Anthropic(api_key=cfg.anthropic_api_key, timeout=60.0)
-        self.tools = tool_definitions(cfg.claude_model, cfg)
         self._updates = _recent_updates(cfg)
-        self.extras: dict[str, Any] = {}
-        if cfg.claude_model.startswith(FALLBACK_MODELS):
-            self.extras = {"betas": [FALLBACK_BETA], "fallbacks": "default"}
-        self.messages: list[dict[str, Any]] = []
+        self.messages: list[Any] = []
         self._prompt_tokens = 0  # 마지막 요청의 입력 토큰 (캐시 포함)
         self._last_turn = 0.0
+
+    # ---------------------------------------------------------------- 제공자가 채우는 부분
+
+    def _run_turn(self, emit: Callable[[str], None], on_tool_start: Callable[[str], None] | None,
+                  cancel: threading.Event, started: float) -> None:
+        """self.messages 끝의 사용자 말에 답한다. 도구를 부르고 결과를 받아 다시 묻는 것을 끝날 때까지 되풀이하며,
+        답 글자는 문장이 될 때마다 emit 한다. 주고받은 내용은 모두 self.messages 에 남긴다."""
+        raise NotImplementedError
+
+    def _complete(self, system: str, text: str) -> str:
+        """도구 없이 한 번 묻고 답 글만 돌려준다 (요약용, 생각은 짧게)."""
+        raise NotImplementedError
+
+    def _describe(self, message: Any) -> list[str]:
+        """사용자 말이 아닌 기록 하나를 '스피커: …' / '(도구 이름 입력)' 줄들로."""
+        raise NotImplementedError
+
+    def _error_kind(self, exc: Exception) -> str | None:
+        """API 오류를 auth | rate | server | connection 으로. 해당 없으면 None (그대로 올려보낸다)."""
+        return None
+
+    # ---------------------------------------------------------------- 공통
 
     def reset(self) -> None:
         """새 대화를 시작한다. 끝난 대화는 뒤에서 한두 문장으로 요약해 기억에 남긴다."""
@@ -140,33 +164,31 @@ class Brain:
             worker.start()
             worker.join(15)
 
+    def system_text(self) -> str:
+        """고정 프롬프트 + 스피커 업데이트 기록 + 기억."""
+        memory = self.toolbox.memory.prompt_block() if self.toolbox.memory is not None else None
+        return SYSTEM_PROMPT + self._updates + (f"\n{memory}" if memory else "")
+
     def _maybe_compact(self) -> None:
         """대화가 길어지면 최근 COMPACT_KEEP_TURNS 턴만 남기고 그 앞은 짧은 요약으로 바꾼다."""
-        starts = [i for i, m in enumerate(self.messages) if m["role"] == "user" and isinstance(m["content"], str)]
+        starts = [i for i, m in enumerate(self.messages) if _is_user_turn(m)]
         if len(starts) <= COMPACT_KEEP_TURNS:
             return
         if self._prompt_tokens < COMPACT_AFTER_TOKENS and len(starts) < COMPACT_AFTER_TURNS:
             return
         cut = starts[-COMPACT_KEEP_TURNS]  # 사용자 말에서 끊어야 도구 호출과 결과 짝이 깨지지 않는다
         old, kept = self.messages[:cut], self.messages[cut:]
-        transcript = _transcript(old)
         t0 = time.monotonic()
         try:
-            response = self.client.messages.create(
-                model=self.cfg.claude_model,
-                max_tokens=2000,
-                output_config={"effort": "low"},
-                system=(
-                    "홈 스피커와 사용자가 지금 나누고 있는 대화의 앞부분입니다. 대화를 이어 가는 데 필요한 것만 "
-                    "한국어 서너 문장으로 요약하세요: 사용자가 원한 것, 스피커가 한 일(튼 음악, 맞춘 알람 등), "
-                    "아직 끝나지 않은 이야기. 목록 기호 없이 쓰세요."
-                ),
-                messages=[{"role": "user", "content": transcript or "(내용 없음)"}],
-            )
-        except anthropic.APIError as exc:
+            summary = self._complete(
+                "홈 스피커와 사용자가 지금 나누고 있는 대화의 앞부분입니다. 대화를 이어 가는 데 필요한 것만 "
+                "한국어 서너 문장으로 요약하세요: 사용자가 원한 것, 스피커가 한 일(튼 음악, 맞춘 알람 등), "
+                "아직 끝나지 않은 이야기. 목록 기호 없이 쓰세요.",
+                self._transcript(old) or "(내용 없음)",
+            ).strip()
+        except Exception as exc:
             log.warning("대화 줄이기 실패, 그대로 둡니다: %s", exc)
             return
-        summary = " ".join(b.text for b in response.content if b.type == "text").strip()
         if not summary:
             return
         first = dict(kept[0])
@@ -175,29 +197,58 @@ class Brain:
         log.info("대화가 길어져 앞부분 %d개 메시지를 요약으로 줄였습니다 (입력 %d토큰, %.1f초).",
                  len(old), self._prompt_tokens, time.monotonic() - t0)
 
-    def _summarize(self, messages: list[dict[str, Any]]) -> None:
-        transcript = _transcript(messages)
+    def _summarize(self, messages: list[Any]) -> None:
+        transcript = self._transcript(messages)
         if not transcript:
             return
         try:
-            response = self.client.messages.create(
-                model=self.cfg.claude_model,
-                max_tokens=2000,
-                output_config={"effort": "low"},
-                system=(
-                    "홈 스피커와 사용자가 나눈 대화 기록입니다. 나중에 '지난번에 뭐 얘기했지?' 같은 질문에 답할 수 있도록, "
-                    "사용자가 무엇을 묻거나 시켰고 어떤 결과였는지 목록 기호 없이 한국어 한두 문장으로 요약하세요. "
-                    "사용자가 잊어 달라고 한 내용은 요약에 쓰지 마세요. "
-                    "음량 조절이나 일시정지처럼 기억할 가치가 없는 조작만 있었다면 '없음'이라고만 쓰세요."
-                ),
-                messages=[{"role": "user", "content": transcript}],
-            )
-        except anthropic.APIError as exc:
+            text = self._complete(
+                "홈 스피커와 사용자가 나눈 대화 기록입니다. 나중에 '지난번에 뭐 얘기했지?' 같은 질문에 답할 수 있도록, "
+                "사용자가 무엇을 묻거나 시켰고 어떤 결과였는지 목록 기호 없이 한국어 한두 문장으로 요약하세요. "
+                "사용자가 잊어 달라고 한 내용은 요약에 쓰지 마세요. "
+                "음량 조절이나 일시정지처럼 기억할 가치가 없는 조작만 있었다면 '없음'이라고만 쓰세요.",
+                transcript,
+            ).strip()
+        except Exception as exc:
             log.warning("지난 대화 요약 실패: %s", exc)
             return
-        text = " ".join(b.text for b in response.content if b.type == "text").strip()
         if text and text.rstrip(".") != "없음":
             self.toolbox.memory.add_summary(text)
+
+    def _transcript(self, messages: list[Any]) -> str:
+        """대화 기록을 '사용자: … / 스피커: …' 글로. 도구 호출 내용은 짧게만 남긴다."""
+        lines = []
+        for m in messages:
+            if _is_user_turn(m):
+                content = m["content"]
+                when = re.search(r"\d{4}-\d{2}-\d{2} \S+ \d{2}:\d{2}", content)
+                text = _CONTEXT_LINE.sub("", content).strip()
+                lines.append(f"사용자{f' ({when.group(0)})' if when else ''}: {text}")
+            else:
+                lines.extend(self._describe(m))
+        return "\n".join(lines)
+
+    def run_tool(self, name: str, args: Any) -> tuple[str, bool]:
+        """도구를 실행해 (결과 글, 오류인지) 를 돌려준다."""
+        try:
+            return self.toolbox.run(name, args), False
+        except ToolError as exc:
+            message = str(exc)
+            if message.startswith("INVALID_JSON"):
+                message = json.dumps({"INVALID_JSON": json.dumps(args, ensure_ascii=False), "detail": message}, ensure_ascii=False)
+            return message, True
+
+    def timed(self, emit: Callable[[str], None], started: float) -> tuple[SentenceSplitter, Callable[[], bool]]:
+        """첫 문장까지 걸린 시간을 남기는 문장 나누개와, 첫 문장이 이미 나갔는지 알려 주는 함수."""
+        said = [False]
+
+        def emit_timed(sentence: str) -> None:
+            if not said[0]:
+                said[0] = True
+                log.info("첫 문장까지 %.1f초", time.monotonic() - started)
+            emit(sentence)
+
+        return SentenceSplitter(emit_timed), lambda: said[0]
 
     def respond(
         self,
@@ -210,7 +261,7 @@ class Brain:
         """한 턴을 처리한다. 답의 문장이 완성될 때마다 on_sentence 를 부르고, 전체 답을 돌려준다.
 
         cancel 이 켜지면(사용자가 말을 끊음) 즉시 멈추고 이번 턴을 대화 기록에서 지운다.
-        follow_up 은 호출어 없이 이어서 들은 말이라는 뜻이다. Claude 가 주변 소리로 판단하면 빈 문자열을 돌려준다.
+        follow_up 은 호출어 없이 이어서 들은 말이라는 뜻이다. 두뇌가 주변 소리로 판단하면 빈 문자열을 돌려준다.
         """
         cancel = cancel or threading.Event()
         now = time.monotonic()
@@ -242,22 +293,19 @@ class Brain:
         except _Cancelled:
             del self.messages[checkpoint:]
             log.info("사용자가 끼어들어 응답을 중단했습니다.")
-        except anthropic.AuthenticationError:
+        except Exception as exc:
+            kind = self._error_kind(exc)
+            if kind is None:
+                del self.messages[checkpoint:]
+                raise
             del self.messages[checkpoint:]
-            log.error("Anthropic API 키가 올바르지 않습니다.")
-            emit("API 키가 올바르지 않아서 답할 수 없어요. 설정을 확인해 주세요.")
-        except anthropic.RateLimitError:
-            del self.messages[checkpoint:]
-            log.warning("요청 한도 초과")
-            emit("지금 요청이 너무 많아요. 잠시 뒤에 다시 말씀해 주세요.")
-        except anthropic.APIStatusError as exc:
-            del self.messages[checkpoint:]
-            log.error("Claude API 오류 %s: %s (request_id=%s)", exc.status_code, exc.message, exc.request_id)
-            emit("서버에 문제가 있어서 답하지 못했어요. 잠시 뒤에 다시 시도해 주세요.")
-        except anthropic.APIConnectionError:
-            del self.messages[checkpoint:]
-            log.error("Claude API 에 연결하지 못했습니다.")
-            emit("인터넷 연결에 문제가 있는 것 같아요.")
+            log.error("%s API 오류 (%s): %s", self.provider, kind, exc)
+            emit({
+                "auth": "API 키가 올바르지 않아서 답할 수 없어요. 설정을 확인해 주세요.",
+                "rate": "지금 요청이 너무 많아요. 잠시 뒤에 다시 말씀해 주세요.",
+                "server": "서버에 문제가 있어서 답하지 못했어요. 잠시 뒤에 다시 시도해 주세요.",
+                "connection": "인터넷 연결에 문제가 있는 것 같아요.",
+            }.get(kind, "답하다가 문제가 생겼어요."))
         if ignored and not spoken:
             del self.messages[checkpoint:]  # 주변 소리는 대화 기록에 남기지 않는다
         elif not cancel.is_set():
@@ -266,7 +314,53 @@ class Brain:
         self._last_turn = time.monotonic()
         return " ".join(spoken)
 
-    # ------------------------------------------------------------------
+
+class ClaudeBrain(BaseBrain):
+    provider = "Claude"
+
+    def __init__(self, cfg: Config, toolbox: ToolBox):
+        if not cfg.anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY 가 없습니다. .env 파일에 넣어 주세요.")
+        super().__init__(cfg, toolbox)
+        self.client = anthropic.Anthropic(api_key=cfg.anthropic_api_key, timeout=60.0)
+        self.tools = tool_definitions(cfg.model, cfg)
+        self.extras: dict[str, Any] = {}
+        if cfg.model.startswith(FALLBACK_MODELS):
+            self.extras = {"betas": [FALLBACK_BETA], "fallbacks": "default"}
+
+    def _error_kind(self, exc: Exception) -> str | None:
+        if isinstance(exc, anthropic.AuthenticationError):
+            return "auth"
+        if isinstance(exc, anthropic.RateLimitError):
+            return "rate"
+        if isinstance(exc, anthropic.APIStatusError):
+            log.error("Claude API 오류 %s: %s (request_id=%s)", exc.status_code, exc.message, exc.request_id)
+            return "server"
+        if isinstance(exc, anthropic.APIConnectionError):
+            return "connection"
+        return None
+
+    def _complete(self, system: str, text: str) -> str:
+        response = self.client.messages.create(
+            model=self.cfg.model,
+            max_tokens=2000,
+            output_config={"effort": "low"},
+            system=system,
+            messages=[{"role": "user", "content": text}],
+        )
+        return " ".join(b.text for b in response.content if b.type == "text")
+
+    def _describe(self, message: Any) -> list[str]:
+        lines = []
+        if message["role"] != "assistant":
+            return lines  # 도구 결과
+        for block in message["content"]:
+            kind = getattr(block, "type", None)
+            if kind == "text" and block.text.strip():
+                lines.append(f"스피커: {block.text.strip()}")
+            elif kind == "tool_use":
+                lines.append(f"(도구 {block.name} {json.dumps(block.input, ensure_ascii=False)})")
+        return lines
 
     def _run_turn(
         self,
@@ -275,28 +369,19 @@ class Brain:
         cancel: threading.Event,
         started: float,
     ) -> None:
-        first_sentence_logged = False
-
-        def emit_timed(sentence: str) -> None:
-            nonlocal first_sentence_logged
-            if not first_sentence_logged:
-                first_sentence_logged = True
-                log.info("첫 문장까지 %.1f초", time.monotonic() - started)
-            emit(sentence)
-
-        splitter = SentenceSplitter(emit_timed)
+        splitter, said = self.timed(emit, started)
         announced_tool = False
         json_retries = 0
 
         for _ in range(MAX_TOOL_ROUNDS):
             try:
                 with self.client.beta.messages.stream(
-                    model=self.cfg.claude_model,
+                    model=self.cfg.model,
                     max_tokens=16000,
                     system=self._system(),
                     tools=self.tools,
                     messages=self.messages,
-                    output_config={"effort": self.cfg.claude_effort},
+                    output_config={"effort": self.cfg.effort},
                     cache_control={"type": "ephemeral"},
                     **self.extras,
                 ) as stream:
@@ -309,7 +394,7 @@ class Brain:
                             event.type == "content_block_start"
                             and event.content_block.type in ("server_tool_use", "tool_use")
                             and not announced_tool
-                            and not first_sentence_logged
+                            and not said()
                         ):
                             # 검색이나 음악 재생은 몇 초 걸리므로, 시작할 때 알려서 조용히 기다리게 하지 않는다.
                             announced_tool = True
@@ -357,7 +442,7 @@ class Brain:
                 # 잘린 도구 입력은 실행하지 않는다.
                 results = [_tool_result(b.id, "입력이 중간에 잘렸습니다. 다시 호출해 주세요.", error=True) for b in tool_uses]
             else:
-                results = [self._execute(block) for block in tool_uses]
+                results = [_tool_result(b.id, *self.run_tool(b.name, b.input)) for b in tool_uses]
             self.messages.append({"role": "user", "content": results})
             if cancel.is_set():
                 raise _Cancelled
@@ -375,14 +460,21 @@ class Brain:
             blocks.append({"type": "text", "text": memory})
         return blocks
 
-    def _execute(self, block: Any) -> dict[str, Any]:
-        try:
-            return _tool_result(block.id, self.toolbox.run(block.name, block.input))
-        except ToolError as exc:
-            message = str(exc)
-            if message.startswith("INVALID_JSON"):
-                message = json.dumps({"INVALID_JSON": json.dumps(block.input, ensure_ascii=False), "detail": message}, ensure_ascii=False)
-            return _tool_result(block.id, message, error=True)
+
+def make_brain(cfg: Config, toolbox: ToolBox) -> BaseBrain:
+    """설정한 제공자의 두뇌를 만든다."""
+    if cfg.provider == "openai":
+        from .brain_openai import OpenAIBrain
+
+        return OpenAIBrain(cfg, toolbox)
+    if cfg.provider == "google":
+        from .brain_gemini import GeminiBrain
+
+        return GeminiBrain(cfg, toolbox)
+    return ClaudeBrain(cfg, toolbox)
+
+
+Brain = make_brain  # 예전 이름
 
 
 class _Cancelled(Exception):
@@ -409,28 +501,12 @@ def _recent_updates(cfg: Config) -> str:
 _CONTEXT_LINE = re.compile(r"^\[상황: [^\n]*\]\n?")
 
 
-def _user_turns(messages: list[dict[str, Any]]) -> int:
-    return sum(1 for m in messages if m["role"] == "user" and isinstance(m["content"], str))
+def _is_user_turn(m: Any) -> bool:
+    return isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str)
 
 
-def _transcript(messages: list[dict[str, Any]]) -> str:
-    """대화 기록을 '사용자: … / 스피커: …' 글로. 도구 호출 내용은 짧게만 남긴다."""
-    lines = []
-    for m in messages:
-        content = m["content"]
-        if m["role"] == "user":
-            if isinstance(content, str):
-                when = re.search(r"\d{4}-\d{2}-\d{2} \S+ \d{2}:\d{2}", content)
-                text = _CONTEXT_LINE.sub("", content).strip()
-                lines.append(f"사용자{f' ({when.group(0)})' if when else ''}: {text}")
-            continue
-        for block in content:
-            kind = getattr(block, "type", None)
-            if kind == "text" and block.text.strip():
-                lines.append(f"스피커: {block.text.strip()}")
-            elif kind == "tool_use":
-                lines.append(f"(도구 {block.name} {json.dumps(block.input, ensure_ascii=False)})")
-    return "\n".join(lines)
+def _user_turns(messages: list[Any]) -> int:
+    return sum(1 for m in messages if _is_user_turn(m))
 
 
 def _tool_result(tool_use_id: str, content: str, error: bool = False) -> dict[str, Any]:

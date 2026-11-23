@@ -2,11 +2,11 @@
 
 안 쓰는 맥북을 한국어로 말하는 홈 스마트 스피커로 바꿔 줍니다.
 
-"스피커야, 아이유 밤편지 틀어줘", "내일 7시에 깨워주고 날씨도 알려줘", "오늘 일정 뭐 있어?" 같은 말을 알아듣고 목소리로 답합니다. 호출어 감지, 음성 인식, 음성 합성은 모두 맥 안에서 돌고, 무엇을 할지 생각하는 두뇌만 Claude API 를 씁니다.
+"스피커야, 아이유 밤편지 틀어줘", "내일 7시에 깨워주고 날씨도 알려줘", "오늘 일정 뭐 있어?" 같은 말을 알아듣고 목소리로 답합니다. 호출어 감지, 음성 인식, 음성 합성은 모두 맥 안에서 돌고, 무엇을 할지 생각하는 두뇌만 클라우드 AI API(Claude, ChatGPT, Gemini 중 하나)를 씁니다.
 
 ```
 마이크 → 호출어(openWakeWord, 한국어 호출 문구) → 음성 인식(Whisper, 로컬)
-      → Claude (음악·알람·일정·메일·웹 검색 도구) → 음성 합성(Qwen3-TTS, 로컬) → 스피커
+      → 두뇌: Claude / ChatGPT / Gemini (음악·알람·일정·메일·웹 검색 도구) → 음성 합성(Qwen3-TTS, 로컬) → 스피커
 ```
 
 **할 수 있는 일**
@@ -24,7 +24,7 @@
 | 맥 | **Apple Silicon (M1 이상)**, macOS 14 이상. 메모리 16GB 권장 |
 | 디스크 | 여유 15GB (음성 모델 약 9GB) |
 | [Homebrew](https://brew.sh) | 없으면 먼저 설치 |
-| Claude API 키 | [console.anthropic.com](https://console.anthropic.com) 에서 발급. 쓴 만큼 요금이 나오는 유료 API 라 결제 수단 등록이 필요합니다 ([요금](https://www.anthropic.com/pricing)). 기본 모델은 가장 저렴한 Haiku 입니다 |
+| AI API 키 하나 | 셋 중 하나: **Claude**(권장, [console.anthropic.com](https://console.anthropic.com)), **ChatGPT**([platform.openai.com](https://platform.openai.com/api-keys)), **Gemini**([aistudio.google.com](https://aistudio.google.com/apikey)). 쓴 만큼 요금이 나오는 API 라 보통 결제 수단 등록이 필요합니다. 기본으로 각 회사의 빠르고 저렴한 모델을 씁니다. 시스템 프롬프트는 Claude 에 맞춰 다듬었습니다 |
 | (선택) YouTube Music 계정 | 내 좋아요·재생목록을 틀 때만 필요. 검색해서 트는 건 로그인 없이 됩니다 |
 
 맥북의 내장 마이크와 스피커로 충분합니다. 덮개는 열어 두세요 (닫으면 내장 마이크가 꺼집니다).
@@ -41,7 +41,7 @@ cd mac-home-speaker
 1. 이 맥에서 돌 수 있는지 확인 (Apple Silicon, macOS 버전, 디스크)
 2. Homebrew 로 `uv`, `mpv`, `node` 설치
 3. 파이썬 패키지 설치 (`uv sync`, 파이썬도 알아서 받음)
-4. `.env` 설정 파일을 만들고 **Claude API 키**와 **사는 도시**를 물어 저장 (키는 화면에 보이지 않고 이 맥에만 저장)
+4. `.env` 설정 파일을 만들고 **두뇌로 쓸 AI 와 API 키**, **사는 도시**, **자동 업데이트** 여부를 물어 저장 (키는 화면에 보이지 않고 이 맥에만 저장)
 5. 음성 인식·합성 모델 내려받기 (약 9GB, 처음 한 번만)
 6. 마이크·스피커·도구 점검
 
@@ -103,7 +103,7 @@ uv run python -m speaker.ytmusic_setup
 시스템 설정 → 인터넷 계정에 Google·iCloud·Exchange(학교·회사) 계정을 추가하면, 맥의 캘린더와 메일 앱에서 일정과 안 읽은 메일을 읽습니다.
 - **캘린더**: 스피커를 실행하는 앱(터미널)에 캘린더 **전체 접근** 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 캘린더. 확인은 `uv run python -m speaker.accounts_check`.
 - **메일**: 처음에 'Mail 을 제어하도록 허용' 창이 뜨면 허용합니다. 메일 앱이 실행되어 있어야 합니다.
-- 홍보·뉴스레터·자동 알림은 빼고, 남은 메일의 보낸 사람·제목·앞부분만 Claude 에 보내 요약합니다. 회사·학교 메일이라면 외부 AI 서비스로 보내도 되는지 먼저 확인하세요.
+- 홍보·뉴스레터·자동 알림은 빼고, 남은 메일의 보낸 사람·제목·앞부분만 두뇌 AI 에 보내 요약합니다. 회사·학교 메일이라면 외부 AI 서비스로 보내도 되는지 먼저 확인하세요.
 - 끄려면 `.env` 에 `CALENDAR=off` 또는 `MAIL=off`.
 
 ### 휴대폰 리모컨 (같은 Wi-Fi)
@@ -128,11 +128,15 @@ uv run python -m speaker.ytmusic_setup
 
 ## 업데이트
 
+설치할 때 **자동 업데이트**를 켰다면(`.env` 의 `AUTO_UPDATE=on`) 할 일이 없습니다. 스피커가 한 시간마다 GitHub 에 새 버전이 있는지 보고, 있으면 음악이나 말이 없는 한가한 때에 받아 와 다시 시작하면서 무엇이 바뀌었는지 말해 줍니다. 이 맥에서 코드를 직접 고쳐 두었거나 따로 커밋해 둔 경우에는 덮어쓰지 않고 건너뜁니다 (로그에 남김).
+
+직접 업데이트하려면:
+
 ```bash
 git pull
 ```
 
-새 코드가 들어오면 켜져 있는 스피커가 음악이나 말이 없는 한가한 때에 스스로 다시 시작하고, 무엇이 바뀌었는지 커밋 제목을 읽어 알려 줍니다. 패키지가 바뀌었다면 `uv sync` 도 한 번 실행하세요. 바로 다시 켜려면 `./restart.sh`.
+새 코드가 들어오면 켜져 있는 스피커가 한가할 때 스스로 다시 시작합니다. 패키지가 바뀌었으면 다시 켤 때 `uv run` 이 알아서 맞춥니다. 바로 다시 켜려면 `./restart.sh`.
 
 ## 설정 (.env)
 
@@ -140,7 +144,9 @@ git pull
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `SPEAKER_MODEL` | `claude-haiku-5-5` | 가장 빠르고 저렴. 더 똑똑한 답이 필요하면 `claude-sonnet-5-5` |
+| `SPEAKER_PROVIDER` | 넣어 둔 키로 정함 | 두뇌: `anthropic`(Claude) / `openai`(ChatGPT) / `google`(Gemini) |
+| `SPEAKER_MODEL` | 제공자별 빠른 모델 | 더 똑똑한 답이 필요하면 바꾸기. 예: `claude-sonnet-5-5` |
+| `AUTO_UPDATE` | `off` (설치할 때 물어봄) | `on` 이면 GitHub 의 새 버전을 한가할 때 받아 와 다시 시작 |
 | `LOCATION_CITY` / `LOCATION_COUNTRY` | 없음 | 날씨·지역 검색 기준 |
 | `WAKE_PHRASE` | `야 듣고 있어` | 처음 한국어 호출 문구. 말로 등록·삭제한 목록이 있으면 그쪽이 우선 |
 | `WAKE_WORD` | `hey_jarvis` | 영어 호출어 (`alexa`, `hey_mycroft` 등). `off` 로 끔 |
@@ -155,7 +161,7 @@ git pull
 ## 개인정보
 
 - **맥 밖으로 나가지 않는 것**: 마이크 소리, 호출어 감지, 음성 인식, 음성 합성.
-- **Claude API 로 보내는 것**: 알아들은 말(글자), 기억해 둔 내용과 지난 대화 요약, 물어본 일정·메일 요약, 도구 결과. 날씨·뉴스는 Claude 의 웹 검색을 씁니다.
+- **두뇌 AI(Claude·ChatGPT·Gemini 중 고른 곳)로 보내는 것**: 알아들은 말(글자), 기억해 둔 내용과 지난 대화 요약, 물어본 일정·메일 요약, 도구 결과. 날씨·뉴스는 그 회사의 웹 검색을 씁니다.
 - 개인 파일은 모두 이 폴더 안에 있고 git 에 올라가지 않습니다: `.env`(API 키), `memory.json`(기억), `ytmusic_auth.json`(계정), `schedule.json`(예약), `state.json`(설정), `logs/`, `certs/`.
 - 기억은 "다 잊어줘"라고 하거나 `memory.json` 을 지우면 사라집니다. 끄려면 `.env` 에 `MEMORY=off`.
 
@@ -184,7 +190,8 @@ git pull
 |---|---|
 | `speaker/main.py` | 전체 흐름 (대기 → 듣기 → 답하기), 알람·브리핑, 자동 업데이트, 점검 |
 | `speaker/audio_in.py` | 마이크, 호출어, 녹음, 음성 인식 |
-| `speaker/brain.py` | Claude 호출, 시스템 프롬프트, 도구 실행 루프, 문장 단위 스트리밍 |
+| `speaker/brain.py` | 시스템 프롬프트, 대화 관리, Claude 두뇌 (도구 실행 루프, 문장 단위 스트리밍) |
+| `speaker/brain_openai.py` / `brain_gemini.py` | ChatGPT·Gemini 두뇌 |
 | `speaker/tools.py` | 도구 정의와 실행 |
 | `speaker/music.py` | YouTube Music 검색(ytmusicapi)과 재생(mpv + yt-dlp) |
 | `speaker/tts.py` | 음성 합성과 알림음 |
@@ -203,4 +210,4 @@ git pull
 - openWakeWord 의 기본 호출어 모델(hey_jarvis 등)은 **CC BY-NC-SA 4.0** 으로, 비상업적 용도로만 쓸 수 있습니다.
 - Qwen3-TTS 는 Apache 2.0, Whisper 는 MIT 입니다.
 - 음악 재생은 ytmusicapi 와 yt-dlp 로 YouTube 에 접근합니다. YouTube 이용약관을 확인하고 개인적인 용도로만 쓰세요.
-- Claude API 사용에는 Anthropic 의 이용약관이 적용됩니다.
+- 두뇌 API 사용에는 고른 회사(Anthropic, OpenAI, Google)의 이용약관이 적용됩니다.

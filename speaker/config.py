@@ -32,8 +32,10 @@ class Config:
 
     # 두뇌 (Claude)
     anthropic_api_key: str | None
-    claude_model: str
-    claude_effort: str
+    gemini_api_key: str | None
+    provider: str  # 두뇌: anthropic | openai | google
+    model: str  # 두뇌 모델
+    effort: str  # 생각의 깊이 (low/medium/high)
 
     # 호출어 / 음성 인식
     wake_word: str  # openWakeWord 사전학습 모델 이름 (hey_jarvis, alexa, hey_mycroft ...)
@@ -76,6 +78,8 @@ class Config:
     location_country: str | None  # 두 글자 국가 코드. 예: US, KR
     timezone: str | None  # 예: America/New_York (비우면 맥 설정에서 읽음)
     auto_reload: bool  # 코드가 바뀌면 한가할 때 스스로 다시 켤지
+    auto_update: bool  # GitHub 에 새 버전이 올라오면 받아 오기 (git pull --ff-only)
+    auto_update_hours: float  # 새 버전을 확인하는 간격
     remote_enabled: bool  # 휴대폰 브라우저 원격 조작 (같은 Wi-Fi, HTTPS + 비밀 토큰)
     remote_port: int
     calendar_enabled: bool  # 맥 캘린더 일정 읽기
@@ -91,15 +95,47 @@ def _system_timezone() -> str | None:
     return target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else None
 
 
+# 두뇌 제공자별 기본 모델: 빠르고 저렴한 쪽. 더 똑똑한 답이 필요하면 SPEAKER_MODEL 로 바꾼다.
+DEFAULT_MODELS = {
+    "anthropic": "claude-haiku-5-5",
+    "openai": "gpt-6-luna",
+    "google": "gemini-3.6-flash",
+}
+PROVIDER_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "google": "GEMINI_API_KEY"}
+
+
+def _provider() -> str:
+    """SPEAKER_PROVIDER 가 있으면 그것, 없으면 SPEAKER_MODEL 이름이나 넣어 둔 API 키로 짐작한다 (Claude 우선)."""
+    wanted = (_env("SPEAKER_PROVIDER") or "").lower()
+    aliases = {"claude": "anthropic", "gpt": "openai", "chatgpt": "openai", "gemini": "google"}
+    wanted = aliases.get(wanted, wanted)
+    if wanted in DEFAULT_MODELS:
+        return wanted
+    model = (_env("SPEAKER_MODEL") or "").lower()
+    for prefix, name in (("claude", "anthropic"), ("gpt", "openai"), ("o", "openai"), ("gemini", "google")):
+        if model.startswith(prefix):
+            return name
+    if _env("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if _env("GEMINI_API_KEY") or _env("GOOGLE_API_KEY"):
+        return "google"
+    if _env("OPENAI_API_KEY"):
+        return "openai"
+    return "anthropic"
+
+
 def load_config() -> Config:
     load_dotenv(PROJECT_DIR / ".env")
+    provider = _provider()
     venv_ytdlp = PROJECT_DIR / ".venv" / "bin" / "yt-dlp"
     return Config(
         project_dir=PROJECT_DIR,
         models_dir=PROJECT_DIR / "models",
         anthropic_api_key=_env("ANTHROPIC_API_KEY"),
-        claude_model=_env("SPEAKER_MODEL", "claude-haiku-5-5"),
-        claude_effort=_env("SPEAKER_EFFORT", "low"),
+        gemini_api_key=_env("GEMINI_API_KEY") or _env("GOOGLE_API_KEY"),
+        provider=provider,
+        model=_env("SPEAKER_MODEL", DEFAULT_MODELS[provider]),
+        effort=_env("SPEAKER_EFFORT", "low"),
         wake_word=_env("WAKE_WORD", "hey_jarvis"),
         wake_threshold=float(_env("WAKE_THRESHOLD", "0.5")),
         wake_threshold_music=float(_env("WAKE_THRESHOLD_MUSIC", "0.25")),
@@ -137,6 +173,8 @@ def load_config() -> Config:
         remote_enabled=_env("REMOTE", "on").lower() not in ("off", "0", "false", "no"),
         remote_port=int(_env("REMOTE_PORT", "8443")),
         auto_reload=_env("AUTO_RELOAD", "on").lower() not in ("off", "0", "false", "no"),
+        auto_update=_env("AUTO_UPDATE", "off").lower() in ("on", "1", "true", "yes"),
+        auto_update_hours=max(0.25, float(_env("AUTO_UPDATE_HOURS", "1"))),
         calendar_enabled=_env("CALENDAR", "on").lower() not in ("off", "0", "false", "no"),
         mail_enabled=_env("MAIL", "on").lower() not in ("off", "0", "false", "no"),
         memory_path=None if _env("MEMORY", "on").lower() in ("off", "0", "false", "no")
