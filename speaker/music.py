@@ -33,6 +33,9 @@ WATCH_URL = "https://music.youtube.com/watch?v={}"
 START_TIMEOUT = 20.0  # 곡을 불러오기 시작해서 소리가 날 때까지 기다리는 최대 시간 (초)
 IPC_TIMEOUT = 5.0
 QUEUE_LIMIT = 50
+MIN_QUEUE = 15  # 고른 재생목록이 이보다 짧으면 비슷한 곡을 뒤에 이어 붙인다
+RECENT_SONGS = 300  # 최근에 들은 곡을 이만큼 기억해, 다음 대기열에서 뒤로 보낸다
+RECENT_PLAYLISTS = 10  # 검색으로 고른 재생목록을 이만큼 기억해, 다음엔 다른 목록을 먼저 고른다
 PODCAST_QUEUE = 11  # 최신 에피소드 + 이전 에피소드 10개 ("다음 에피소드" 용)
 
 
@@ -84,6 +87,47 @@ def _prefer_audio(items: list[dict], min_audio: int = 5) -> list[dict]:
     items = [t for t in items if _is_audio_track(t) or not _is_performance(t)]
     audio = [t for t in items if _is_audio_track(t)]
     return audio if len(audio) >= min_audio else items
+
+
+_SEASON = {12: "겨울", 1: "겨울", 2: "겨울", 3: "봄", 4: "봄", 5: "봄",
+           6: "여름", 7: "여름", 8: "여름", 9: "가을", 10: "가을", 11: "가을"}
+_TIME_WORDS = ("아침", "점심", "오후", "저녁", "밤", "새벽", "출근", "퇴근", "자기 전", "잘 때")
+
+
+def _query_variants(query: str, now: datetime.datetime | None = None) -> list[str]:
+    """같은 검색어(예: 알람의 '재즈')로 매번 같은 재생목록만 나오지 않도록, 뜻이 같은 변형 검색어들 (순서는 무작위).
+
+    결과가 맞는지는 원래 검색어로 판단하므로, 덧붙이는 말은 시간대·계절·'모음' 같은 가벼운 수식어만 쓴다.
+    ('명곡'·'감성' 같은 말은 '재즈 명곡' → 트로트 목록처럼 엉뚱한 쪽으로 끌고 가서 쓰지 않는다.)
+    """
+    base = " ".join((query or "").split())
+    if not base:
+        return []
+    now = now or datetime.datetime.now()
+    h = now.hour
+    tod = "아침" if 5 <= h < 11 else "오후" if 11 <= h < 17 else "저녁" if 17 <= h < 21 else "밤"
+    has_time = any(w in base for w in _TIME_WORDS)
+    short = len(base.split()) <= 2
+    cands = [
+        (f"{tod} {base}", not has_time),
+        (f"{_SEASON[now.month]} {base}", not any(s in base for s in ("봄", "여름", "가을", "겨울"))),
+        (f"{base} 플레이리스트", not any(w in base for w in ("플레이리스트", "재생목록", "플리"))),
+        (f"{base} 모음", "모음" not in base),
+        (f"요즘 듣기 좋은 {base}", short and not has_time),
+    ]
+    out = [q for q, ok in cands if ok]
+    random.shuffle(out)
+    return out
+
+
+def _freshen(tracks: list[tuple[str, str, str]], recent: set[str], shuffle: bool = True,
+             keep_first: int = 0) -> list[tuple[str, str, str]]:
+    """대기열 순서를 매번 다르게: (선택) 섞고, 최근에 들은 곡은 뒤로 보낸다. 앞의 keep_first 곡은 그대로 둔다."""
+    head, rest = list(tracks[:keep_first]), list(tracks[keep_first:])
+    if shuffle:
+        random.shuffle(rest)
+    rest.sort(key=lambda t: t[0] in recent)  # 안정 정렬: 안 들은 곡이 앞, 각 묶음 안의 순서는 유지
+    return head + rest
 
 
 def _best_playlist(name: str, playlists: list[dict]) -> dict | None:
@@ -329,7 +373,58 @@ class MusicPlayer:
         self._starting = False
         # 불러오기에 실패했을 때 부를 함수 (한국어 안내 문구를 받는다). main 에서 음성 안내를 연결한다.
         self.on_error: Callable[[str], None] | None = None
+        # 최근에 들은 곡·고른 재생목록 (state.json 에 저장해 다시 켜도 유지)
+        self._history_lock = threading.Lock()
+        self._recent_songs: list[str] | None = None
+        self._recent_playlists: list[str] = []
+        self._last_noted: str | None = None
         atexit.register(self.shutdown)
+
+    # ------------------------------------------------------------ 최근 재생 기록
+
+    def _load_history(self) -> None:
+        if self._recent_songs is not None:
+            return
+        from .tools import load_state
+
+        state = load_state(self.cfg)
+        self._recent_songs = [v for v in state.get("music_recent_songs") or [] if isinstance(v, str)][-RECENT_SONGS:]
+        self._recent_playlists = [v for v in state.get("music_recent_playlists") or [] if isinstance(v, str)][-RECENT_PLAYLISTS:]
+
+    def _save_history(self) -> None:
+        from .tools import save_state
+
+        try:
+            save_state(self.cfg, music_recent_songs=self._recent_songs, music_recent_playlists=self._recent_playlists)
+        except OSError:
+            log.warning("최근 재생 기록을 저장하지 못했습니다", exc_info=True)
+
+    def recent_songs(self) -> set[str]:
+        with self._history_lock:
+            self._load_history()
+            return set(self._recent_songs or [])
+
+    def recent_playlists(self) -> list[str]:
+        with self._history_lock:
+            self._load_history()
+            return list(self._recent_playlists)
+
+    def _note_played(self, vid: str) -> None:
+        """지금 나오는 곡을 최근 기록에 넣는다 (now_playing 이 곡이 바뀐 걸 볼 때 부른다)."""
+        if vid == self._last_noted:
+            return
+        self._last_noted = vid
+        with self._history_lock:
+            self._load_history()
+            songs = [v for v in self._recent_songs or [] if v != vid] + [vid]
+            self._recent_songs = songs[-RECENT_SONGS:]
+            self._save_history()
+
+    def _note_playlist(self, browse_id: str) -> None:
+        with self._history_lock:
+            self._load_history()
+            self._recent_playlists = ([p for p in self._recent_playlists if p != browse_id] + [browse_id])[-RECENT_PLAYLISTS:]
+            self._save_history()
 
     # ------------------------------------------------------------ 검색
 
@@ -395,7 +490,8 @@ class MusicPlayer:
                     for t in top[:1]) or any(_norm(t) == _norm(_artists(hit)) for t in top)
         if not (_relevant(query, texts) or agree):
             raise MusicError(f"'{query}'에 해당하는 곡을 찾지 못했습니다.")
-        tracks = [seed] + tracks
+        # 고른 곡은 맨 앞 그대로, 이어지는 비슷한 곡은 비슷한 순서를 지키되 최근에 들은 곡만 뒤로
+        tracks = _freshen([seed] + tracks, self.recent_songs(), shuffle=False, keep_first=1)
         title, artist = seed[1], seed[2]
         desc = f"{artist}의 '{title}'{_josa(title, '을', '를')} 재생합니다." if artist else f"'{title}'{_josa(title, '을', '를')} 재생합니다."
         if len(tracks) > 1:
@@ -428,7 +524,9 @@ class MusicPlayer:
         tracks = self._tracks(_prefer_audio(items))
         if not tracks:
             raise MusicError(f"{name}의 곡을 찾지 못했습니다.")
-        desc = f"{name}의 인기곡 {len(tracks)}곡을 재생합니다. 첫 곡은 '{tracks[0][1]}'입니다."
+        # 매번 1위 곡부터 같은 순서로 나오지 않게 섞는다 (최근에 들은 곡은 뒤로)
+        tracks = _freshen(tracks, self.recent_songs())
+        desc = f"{name}의 인기곡 {len(tracks)}곡을 섞어서 재생합니다. 첫 곡은 '{tracks[0][1]}'입니다."
         return tracks, desc
 
     @staticmethod
@@ -448,23 +546,46 @@ class MusicPlayer:
         return list(out.values())
 
     def _search_playlist(self, en, ko, query, top_future):
-        found: dict[str, list[dict]] = {}
-        for flt in ("community_playlists", "featured_playlists"):
+        # 원래 검색어 + 무작위 변형 둘('아침 재즈', '재즈 모음' …)을 함께 검색해 후보를 넓힌다.
+        # 같은 말로 매일 찾아도(알람 음악) 매번 같은 목록만 나오지 않게.
+        queries = [query] + _query_variants(query)[:2]
+        flts = ("community_playlists", "featured_playlists")
+
+        def search(q: str, flt: str) -> list[dict]:
             try:
-                found[flt] = [p for p in en.search(query, filter=flt, limit=5) if p.get("browseId")]
+                return [p for p in en.search(q, filter=flt, limit=5) or [] if p.get("browseId")]
             except Exception:
-                found[flt] = []
-                log.warning("재생목록 검색 실패 (%s)", flt, exc_info=True)
-        comm, feat = found["community_playlists"], found["featured_playlists"]
+                log.warning("재생목록 검색 실패 (%s: %s)", flt, q, exc_info=True)
+                return []
+
+        with ThreadPoolExecutor(max_workers=len(queries) * len(flts)) as pool:
+            jobs = {(q, f): pool.submit(search, q, f) for q in queries for f in flts}
+            found = {k: j.result() for k, j in jobs.items()}
+
+        def merged(flt: str) -> list[dict]:
+            seen: set[str] = set()
+            out = []
+            for q in queries:
+                for p in found[(q, flt)]:
+                    if p["browseId"] not in seen:
+                        seen.add(p["browseId"])
+                        out.append(p)
+            return out
+
+        comm, feat = merged("community_playlists"), merged("featured_playlists")
         if not comm and not feat:
             raise MusicError(f"'{query}' 재생목록을 찾지 못했습니다.")
-        # 한국어 검색어엔 공식(featured) 목록이 엉뚱한 경우가 많아, 제목이 검색어와 겹치는 목록을 우선.
+        log.info("재생목록 검색어: %s", " / ".join(queries))
+        # 한국어 검색어엔 공식(featured) 목록이 엉뚱한 경우가 많아, 제목이 (원래) 검색어와 겹치는 목록을 우선.
         def hit(p: dict) -> bool:
             return _relevant(query, [p.get("title", "")])
 
-        matched = [p for p in comm + feat if hit(p)][:3]
-        if not matched and not _relevant(query, top_future.result()):
+        matched_all = [p for p in comm + feat if hit(p)]
+        if not matched_all and not _relevant(query, top_future.result()):
             raise MusicError(f"'{query}' 재생목록을 찾지 못했습니다.")
+        # 위쪽 후보를 한꺼번에 불러 본다. 최근에 고른 목록이 너무 많이 자리를 차지하지 않게, 안 고른 목록을 앞에 둔다.
+        recent = self.recent_playlists()
+        matched = sorted(matched_all, key=lambda p: p["browseId"] in recent)[:8]
         fallback = [p for p in feat + comm if not hit(p)][:1]
         cands = matched + fallback
 
@@ -478,34 +599,61 @@ class MusicPlayer:
                 pl = ko.get_playlist(p["browseId"], limit=QUEUE_LIMIT)
             except Exception:
                 log.warning("재생목록 불러오기 실패: %s", p.get("title"), exc_info=True)
-                return [], [], ""
+                return [], [], "", p["browseId"]
             items = _prefer_audio(pl.get("tracks") or [])
-            return self._tracks([t for t in items if usable(t)]), self._tracks(items), pl.get("title") or p.get("title") or query
+            title = pl.get("title") or p.get("title") or query
+            return self._tracks([t for t in items if usable(t)]), self._tracks(items), title, p["browseId"]
 
         with ThreadPoolExecutor(max_workers=len(cands)) as pool:
             results = list(pool.map(fetch, cands))
-        # 우선순위: 제목이 맞고 곡이 10개 이상 → 제목이 맞고 곡이 가장 많은 것(3개 이상)
-        #          → 제목이 맞는 첫 목록(긴 믹스여도 분위기가 맞는 쪽) → 대체 목록
+        # 우선순위 (질 먼저, 그다음 새로움):
+        #   곡 10개 이상·최근에 안 고른 것(여럿이면 무작위) → 곡 10개 이상·최근에 고른 것(가장 오래전 것)
+        #   → 곡 3개 이상(안 고른 것, 곡이 많은 것 먼저) → 제목이 맞는 첫 목록(긴 믹스여도 분위기가 맞는 쪽) → 대체 목록
         m_res, f_res = results[: len(matched)], results[len(matched):]
-        good = sorted([r for r in m_res if len(r[0]) >= 10], key=lambda r: -len(r[0]))
+        is_recent = lambda r: r[3] in recent  # noqa: E731
+        age = lambda r: recent.index(r[3]) if r[3] in recent else -1  # noqa: E731  작을수록 오래전
+        good = [r for r in m_res if len(r[0]) >= 10]
         some = [r for r in m_res if len(r[0]) >= 3]
-        anyr = [r for r in m_res if r[1]]
-        if good:
-            chosen = good[0]
+        anyr = sorted([r for r in m_res if r[1]], key=is_recent)
+        if any(not is_recent(r) for r in good):
+            chosen = random.choice([r for r in good if not is_recent(r)])
+        elif good:
+            chosen = min(good, key=age)
         elif some:
-            chosen = max(some, key=lambda r: len(r[0]))
+            chosen = max(some, key=lambda r: (not is_recent(r), len(r[0])))
         elif anyr:
             chosen = anyr[0]
         else:
             chosen = max(f_res or results, key=lambda r: (len(r[0]), len(r[1])))
-        tracks = chosen[0] if len(chosen[0]) >= 3 else chosen[1]
+        songs = len(chosen[0]) >= 3  # 곡 단위 목록인지 (아니면 몇 시간짜리 믹스 영상들)
+        tracks = chosen[0] if songs else chosen[1]
         title = chosen[2]
         if not tracks:
             raise MusicError(f"'{query}' 재생목록을 불러오지 못했습니다.")
-        desc = f"'{title}' 재생목록의 {len(tracks)}곡을 재생합니다."
+        self._note_playlist(chosen[3])
+        if songs:
+            tracks = _freshen(tracks, self.recent_songs())
+        desc = f"'{title}' 재생목록의 {len(tracks)}곡을 섞어서 재생합니다." if songs else f"'{title}' 재생목록을 재생합니다."
+        if songs and len(tracks) < MIN_QUEUE:
+            extra = self._similar(ko, tracks)
+            if extra:
+                tracks += extra
+                desc = f"'{title}' 재생목록의 {len(tracks) - len(extra)}곡과 비슷한 곡 {len(extra)}곡을 재생합니다."
         if len(tracks[0][1]) <= 40:  # 긴 믹스 영상 제목은 읽지 않는다
             desc += f" 첫 곡은 '{tracks[0][1]}'입니다."
         return tracks, desc
+
+    def _similar(self, ko, tracks: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+        """짧은 재생목록 뒤에 붙일 비슷한 곡: 목록 안의 곡 하나를 골라 유튜브 뮤직 '라디오'를 받는다."""
+        seed = random.choice(tracks)[0]
+        try:
+            radio = ko.get_watch_playlist(videoId=seed, limit=QUEUE_LIMIT).get("tracks") or []
+        except Exception:
+            log.warning("비슷한 곡을 가져오지 못했습니다", exc_info=True)
+            return []
+        have = {t[0] for t in tracks}
+        extra = [t for t in self._tracks(_prefer_audio(radio)) if t[0] not in have]
+        return _freshen(extra, self.recent_songs(), shuffle=False)[: QUEUE_LIMIT - len(tracks)]
 
     # ------------------------------------------------------------ mpv 프로세스
 
@@ -724,7 +872,7 @@ class MusicPlayer:
         if not tracks:
             raise MusicError("재생할 곡이 없습니다.")
         if shuffle:
-            random.shuffle(tracks)
+            tracks = _freshen(tracks, self.recent_songs())  # 섞되 최근에 들은 곡은 뒤로
             desc += " 섞어서 재생합니다."
         log.info("보관함 불러오기 %.1fs: %s (%d곡)", time.monotonic() - t0, desc, len(tracks))
         return self._start_queue(tracks, desc, t0, wait)
@@ -767,6 +915,7 @@ class MusicPlayer:
                 radio["tracks"] = _prefer_audio(radio.get("tracks") or [])
                 seen = {t[0] for t in tracks}
                 tracks += [t for t in self._tracks(radio.get("tracks") or []) if t[0] not in seen]
+                tracks = _freshen(tracks, self.recent_songs(), shuffle=False)  # 최근에 들은 곡은 뒤로
                 return tracks[:QUEUE_LIMIT], f"'{row.get('title')}' 추천 곡을 재생합니다."
         for row in rows:
             for c in row.get("contents") or []:
@@ -1138,6 +1287,7 @@ class MusicPlayer:
             path = self._get("path")
             vid = _video_id(path)
             if vid and vid in self._meta:
+                self._note_played(vid)
                 title, artist = self._meta[vid]
                 return f"{title} - {artist}" if artist else title
             title = self._get("media-title")
